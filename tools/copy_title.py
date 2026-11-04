@@ -1,4 +1,12 @@
 # Robot penyalin judul untuk GitHub Actions (berjalan di runner, token repo sendiri).
+# v5.5 (5 Nov 2026): IKUT MENYALIN SUBTITLE sumber — trek EN + ID dari master
+# sumber (dari master HLS DAN field 'tracks' respons API sumber — robot lama
+# mengabaikan field itu seluruhnya) diambil sebagai berkas VTT datar
+# (sub-en.vtt/sub-id.vtt) + playlist
+# pembungkus (subs-en.m3u8/subs-id.m3u8), dan playlist.m3u8 episode menyatakan
+# #EXT-X-MEDIA TYPE=SUBTITLES NAME="English"/"Indonesian" LANGUAGE en/id
+# (pola yang sama dengan ongoing_lane yang terbukti di aplikasi). Tanpa
+# subtitle sumber, tata letak identik v5.4 (degradasi anggun). Selebihnya v5.4:
 # v5.4 (31 Okt 2026): push_episode DIPECAH per potongan (maks ~250 MB per push,
 # playlist.m3u8 SELALU di potongan terakhir) — satu push tunggal film utuh
 # (166-172 potongan, >2 GB) ditolak GitHub HTTP 500/RPC failed 5/5 (terbukti
@@ -31,6 +39,7 @@ OUT = os.path.join(os.getcwd(), 'work', WID)
 REPO_DIR = os.path.join(os.getcwd(), 'repo')
 DIRECT_OK = {'v': None}  # None=belum tahu, True=langsung bisa, False=wajib proxy
 HEAD_NOW = {'sha': None}  # commit induk berjalan; diperbarui sesudah tiap push sukses
+EP_SUBS = {}  # v5.5: {nomor_ep: ['en','id']} bahasa subtitle yang tersalin
 
 def log(*a): print(time.strftime('%H:%M:%S'), *a, flush=True)
 
@@ -84,6 +93,94 @@ def parse_variant(master, stream_url, ref):
     if not segs: return None
     return (pl, pl_base, durs, segs)
 
+def norm_lang(v):
+    v = (v or '').strip().lower().replace('_', '-')
+    base = v.split('-')[0]
+    if base in ('en', 'eng'): return 'en'
+    if base in ('id', 'ind', 'in'): return 'id'
+    return None
+
+def parse_subtitles(master, stream_url):
+    """Trek subtitle dari master sumber: {lang: url_absolut} untuk en/id.
+    Bahasa dari atribut LANGUAGE; nama trek (mis. 'Indonesian') jadi cadangan."""
+    out = {}
+    for l in master.splitlines():
+        l = l.strip()
+        if not l.startswith('#EXT-X-MEDIA:') or 'TYPE=SUBTITLES' not in l: continue
+        attrs = {}
+        for part in l.split(':', 1)[1].split(','):
+            if '=' in part:
+                k, v = part.split('=', 1)
+                attrs[k.strip()] = v.strip().strip('"')
+        uri = attrs.get('URI')
+        if not uri: continue
+        lang = norm_lang(attrs.get('LANGUAGE'))
+        if not lang:
+            nm = (attrs.get('NAME') or '').lower()
+            if nm.startswith('english'): lang = 'en'
+            elif nm.startswith('indones'): lang = 'id'
+        if lang and lang not in out:
+            out[lang] = resolve_ref(stream_url, uri)
+    return out
+
+def srt_to_vtt(text):
+    lines = ['WEBVTT', '']
+    for l in text.replace('\r\n', '\n').replace('\r', '\n').split('\n'):
+        if '-->' in l: l = l.replace(',', '.')
+        lines.append(l)
+    return '\n'.join(lines)
+
+def fetch_subtitle_vtt(uri, ref):
+    """Ambil satu trek subtitle sumber -> teks VTT tunggal tervalidasi / None.
+    URI bisa menunjuk berkas .vtt tunggal, daftar putar .vtt tersegmentasi,
+    atau (jarang) .srt."""
+    raw = fetch_raw_smart(uri, ref)
+    if not raw: return None
+    text = raw.decode('utf-8-sig', 'replace')
+    if text.lstrip().startswith('#EXTM3U'):
+        parts, pending = [], None
+        for l in text.splitlines():
+            l = l.strip()
+            if l and not l.startswith('#'): parts.append(l)
+        if not parts: return None
+        bodies = []
+        for p in parts:
+            r2 = fetch_raw_smart(resolve_ref(uri, p), ref)
+            if not r2: return None
+            t2 = r2.decode('utf-8-sig', 'replace')
+            if t2.lstrip().startswith('WEBVTT'):
+                # buang blok header (WEBVTT + metadata s.d. baris kosong pertama)
+                idx = t2.find('\n\n')
+                t2 = t2[idx + 2:] if idx >= 0 else ''
+            bodies.append(t2.strip())
+        text = 'WEBVTT\n\n' + '\n\n'.join(b for b in bodies if b) + '\n'
+    elif not text.lstrip().startswith('WEBVTT'):
+        if '-->' in text and ',' in text.split('-->')[0][-14:]:
+            text = srt_to_vtt(text)
+        else:
+            return None
+    if text.count('-->') < 10: return None
+    return text
+
+def parse_tracks(tracks):
+    """Field 'tracks' respons API sumber -> {lang: url} untuk en/id.
+    Trek 'thumbnails' disaring (itu pratinjau gambar, bukan subtitle)."""
+    out = {}
+    for t in tracks or []:
+        url = t.get('url') or ''
+        if not url or 'thumbnail' in url.lower(): continue
+        if (t.get('kind') or '').lower() == 'thumbnails': continue
+        raw = (t.get('lang') or '').strip().lower()
+        label = (t.get('label') or '').strip().lower()
+        lang = None
+        if raw.startswith('english') or norm_lang(raw): lang = norm_lang(raw) or 'en'
+        if raw.startswith('indones') or raw.startswith('bahasa'): lang = 'id'
+        if not lang:
+            if label.startswith('english'): lang = 'en'
+            elif label.startswith('indones'): lang = 'id'
+        if lang and lang not in out: out[lang] = url
+    return out
+
 def fetch_segment(s_abs, ref):
     if s_abs.startswith(WORKER): return curl_bytes(s_abs, tries=2)
     data = curl_bytes(s_abs, tries=2, ref=ref)
@@ -108,11 +205,12 @@ def resolve_source(slug_id, num, skip=0):
         s = anidap_json(f'https://chad.anidap.lol/rest/api/sources?id={urllib.parse.quote(slug_id)}&epNum={num}&type=sub&providerId={urllib.parse.quote(prov["id"])}')
         if not s: continue
         ref = (s.get('headers') or {}).get('Referer') or 'https://megaplay.buzz/'
+        trk = parse_tracks(s.get('tracks'))
         for x in (s.get('sources') or []):
-            if x.get('url'): cands.append((x['url'], ref))
+            if x.get('url'): cands.append((x['url'], ref, trk))
     cands.sort(key=lambda c: 0 if 'nexabloom' in c[0] else 1)
     def probe(cand):
-        u, ref = cand
+        u, ref = cand[0], cand[1]
         raw = fetch_raw_smart(u, ref, tries=2)
         if not raw or not raw.decode('utf-8', 'replace').lstrip().startswith('#EXTM3U'):
             return None
@@ -126,13 +224,17 @@ def resolve_source(slug_id, num, skip=0):
         for idx in {0, len(segs) // 2}:
             s_abs = resolve_ref(pl_base, segs[idx])
             if not is_ts(fetch_segment(s_abs, ref)): return None
-        return (pl, pl_base, durs, segs, ref)
+        subs = dict(cand[2])
+        subs.update(parse_subtitles(master, u))
+        return (pl, pl_base, durs, segs, ref, subs)
     # Probing paralel; ex.map menjaga urutan hasil = urutan kandidat (deterministik).
     with ThreadPoolExecutor(max_workers=6) as ex:
         probed = list(ex.map(probe, cands))
     cands_ok = [p for p in probed if p]
     if not cands_ok: return None
-    return cands_ok[skip % len(cands_ok)]
+    chosen = cands_ok[skip % len(cands_ok)]
+    sub_sources = [(p[5], p[4]) for p in cands_ok if p[5]]
+    return chosen + (sub_sources,)
 
 def fetch_playlist(url, ref):
     if url.startswith(WORKER):
@@ -157,7 +259,7 @@ def download_episode(slug_id, num, outdir, start_skip=0):
         if not got:
             log(f'  ep{num}: resolusi kosong (coba {cand_try + 1}/3)'); time.sleep(10)
             continue
-        pl, pl_base, durs, segs, referer = got
+        pl, pl_base, durs, segs, referer, _cand_subs, sub_sources = got
         if prev_base is not None and pl_base != prev_base:
             # Ganti kandidat = segmentasi berbeda; buang sisa segmen kandidat lama.
             for fn in os.listdir(outdir):
@@ -209,6 +311,46 @@ def download_episode(slug_id, num, outdir, start_skip=0):
         f.write(f'#EXT-X-TARGETDURATION:{target}\n#EXT-X-MEDIA-SEQUENCE:0\n')
         for i, dd in enumerate(chunk_durs): f.write(f'#EXTINF:{dd:.3f},\nchunk-{i:03d}.ts\n')
         f.write('#EXT-X-ENDLIST\n')
+    # v5.5: salin subtitle sumber (EN + ID bila ada) sebagai trek native.
+    subs = {}
+    for suris, sref in (sub_sources or []):
+        for lang in ('en', 'id'):
+            if lang in subs or lang not in suris: continue
+            vtt = fetch_subtitle_vtt(suris[lang], sref)
+            if vtt: subs[lang] = vtt
+        if len(subs) >= 2: break
+    if subs:
+        dur = sum(chunk_durs)
+        for lang, vtt in subs.items():
+            with open(os.path.join(outdir, f'sub-{lang}.vtt'), 'w') as f: f.write(vtt)
+            with open(os.path.join(outdir, f'subs-{lang}.m3u8'), 'w') as f:
+                f.write('#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-PLAYLIST-TYPE:VOD\n')
+                f.write(f'#EXT-X-TARGETDURATION:{int(dur) + 1}\n#EXT-X-MEDIA-SEQUENCE:0\n')
+                f.write(f'#EXTINF:{dur:.3f},\nsub-{lang}.vtt\n#EXT-X-ENDLIST\n')
+        # Master MULTIVARIAN SEJATI (revisi 5 Nov 03:0x): playlist.m3u8 menjadi
+        # master yang menunjuk video.m3u8 — pola hybrid (MEDIA di dalam media
+        # playlist) tidak terbaca sebagai trek oleh pemutar di HP user.
+        media = ''
+        if 'en' in subs:
+            media += ('#EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID="subs",NAME="English",LANGUAGE="en",'
+                      'DEFAULT=YES,AUTOSELECT=YES,URI="subs-en.m3u8"\n')
+        if 'id' in subs:
+            media += ('#EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID="subs",NAME="Indonesian",LANGUAGE="id",'
+                      'DEFAULT=NO,AUTOSELECT=YES,URI="subs-id.m3u8"\n')
+        p = os.path.join(outdir, 'playlist.m3u8')
+        video_text = open(p).read()
+        with open(os.path.join(outdir, 'video.m3u8'), 'w') as f: f.write(video_text)
+        total_bytes = sum(os.path.getsize(os.path.join(outdir, f'chunk-{i:03d}.ts'))
+                          for i in range(len(chunk_durs)))
+        bw = max(500000, int(total_bytes * 8 / max(1.0, dur)))
+        with open(p, 'w') as f:
+            f.write('#EXTM3U\n#EXT-X-VERSION:3\n')
+            f.write(media)
+            f.write(f'#EXT-X-STREAM-INF:BANDWIDTH={bw},SUBTITLES="subs"\nvideo.m3u8\n')
+        EP_SUBS[num] = sorted(subs)
+        log(f'  ep{num}: subtitle tersalin: {"+".join(sorted(subs))}')
+    else:
+        log(f'  ep{num}: sumber tanpa subtitle yang bisa disalin')
     log(f'  ep{num}: {len(groups)} potongan besar, {sum(chunk_durs):.0f} dtk OK')
     return True
 
@@ -345,7 +487,8 @@ def push_episode(ep):
 
 def push_manifest(pin):
     manifest = {'wid': WID, 'anilistId': ANILIST, 'name': NAME, 'totalEpisodes': TOTAL,
-                'repo': REPO, 'pin': pin}
+                'repo': REPO, 'pin': pin,
+                'subs': {str(k): v for k, v in sorted(EP_SUBS.items())}}
     data = json.dumps(manifest, indent=1).encode()
     r = subprocess.run(['git', '-C', REPO_DIR, 'hash-object', '-w', '--stdin'],
                        input=data, capture_output=True, timeout=120)
