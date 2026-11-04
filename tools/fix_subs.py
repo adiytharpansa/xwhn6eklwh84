@@ -64,7 +64,7 @@ def fix_episode(ep):
     text = git_show(path)
     if text is None:
         log(f'  ep{ep}: playlist tidak ada di repo, dilewati'); return 'missing'
-    if '#EXT-X-MEDIA' in text:
+    if '#EXT-X-MEDIA:' in text:
         log(f'  ep{ep}: sudah punya trek subtitle, dilewati'); return 'already'
     subs = collect_subs(ep)
     if not subs:
