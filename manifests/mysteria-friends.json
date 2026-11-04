@@ -4,37 +4,47 @@
  "name": "Mysteria Friends",
  "totalEpisodes": 10,
  "repo": "adiytharpansa/xwhn6eklwh84",
- "pin": "7dc5c6bb1baaaa48a859735ecfcac459b2f9de3f",
+ "pin": "74e90f5b4f8187f6e44bd80967383b5f6a0dfa83",
  "subs": {
   "1": [
-   "en"
+   "en",
+   "id"
   ],
   "2": [
-   "en"
+   "en",
+   "id"
   ],
   "3": [
-   "en"
+   "en",
+   "id"
   ],
   "4": [
-   "en"
+   "en",
+   "id"
   ],
   "5": [
-   "en"
+   "en",
+   "id"
   ],
   "6": [
-   "en"
+   "en",
+   "id"
   ],
   "7": [
-   "en"
+   "en",
+   "id"
   ],
   "8": [
-   "en"
+   "en",
+   "id"
   ],
   "9": [
-   "en"
+   "en",
+   "id"
   ],
   "10": [
-   "en"
+   "en",
+   "id"
   ]
  }
 }
