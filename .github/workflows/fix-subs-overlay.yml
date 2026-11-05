@@ -36,4 +36,6 @@ jobs:
           curl -s -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github.raw" "https://api.github.com/repos/${{ github.repository }}/contents/tools/fix_subs_overlay.py" -o tools_dl/fix_subs_overlay.py || true
           ls -la tools_dl
           grep -m1 "v5.5 (5 Nov 2026" tools_dl/copy_title.py || echo "PERINGATAN: robot yang terambil BUKAN v5.5"
+          python3 -m pip install --quiet ctranslate2 subword-nmt || echo "PERINGATAN: paket terjemahan gagal dipasang"
+          mkdir -p argos-model && curl -sL --max-time 600 "https://argos-net.com/v1/translate-en_id-1_9.argosmodel" -o argos-model/model.argosmodel && (cd argos-model && python3 -c "import zipfile; zipfile.ZipFile('model.argosmodel').extractall('.')") || echo "PERINGATAN: model terjemahan gagal diunduh"
           python3 tools_dl/fix_subs_overlay.py

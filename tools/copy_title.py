@@ -1,3 +1,8 @@
+# v5.6 (5 Nov 2026): GERBANG SUBTITLE EN+ID ditegakkan — bila sumber hanya
+# memberi EN, sub ID DIBUAT dari EN memakai terjemahan luring Argos en_id
+# (model diunduh workflow ke ./argos-model; pola ongoing_lane). Episode
+# yang sumbernya tanpa EN sama sekali tetap tanpa trek (tidak dikarang).
+# Selebihnya identik v5.5:
 # Robot penyalin judul untuk GitHub Actions (berjalan di runner, token repo sendiri).
 # v5.5 (5 Nov 2026): IKUT MENYALIN SUBTITLE sumber — trek EN + ID dari master
 # sumber (dari master HLS DAN field 'tracks' respons API sumber — robot lama
@@ -42,6 +47,70 @@ HEAD_NOW = {'sha': None}  # commit induk berjalan; diperbarui sesudah tiap push 
 EP_SUBS = {}  # v5.5: {nomor_ep: ['en','id']} bahasa subtitle yang tersalin
 
 def log(*a): print(time.strftime('%H:%M:%S'), *a, flush=True)
+
+# --- Terjemahan cadangan EN->ID (Argos en_id 1.9 via ctranslate2 + BPE) ---
+# Dipakai bila sumber hanya menyediakan trek EN: sub ID dibuat dari EN dengan
+# stempel waktu persis (pola ongoing_lane yang disetujui user). Model diunduh
+# workflow ke ./argos-model (ARGOS_MODEL_DIR). Gagal total -> None (pemanggil
+# memutuskan; tidak pernah mengarang teks).
+_TR_STATE = {'v': None}
+def _load_tr():
+    if _TR_STATE['v'] is not None: return _TR_STATE['v'] or None
+    _TR_STATE['v'] = False
+    try:
+        import ctranslate2, glob
+        from subword_nmt.apply_bpe import BPE
+        roots = [os.environ.get('ARGOS_MODEL_DIR') or '',
+                 os.path.join(os.getcwd(), 'argos-model'),
+                 os.path.join(os.getcwd(), 'argos-models'),
+                 os.path.expanduser('~/workspace/projectx-app/argos-models')]
+        base = None
+        for root in roots:
+            if not root: continue
+            for cand in glob.glob(os.path.join(root, '**', 'bpe.model'), recursive=True):
+                d = os.path.dirname(cand)
+                if os.path.isdir(os.path.join(d, 'model')): base = d; break
+            if base: break
+        if base:
+            bpe = BPE(open(os.path.join(base, 'bpe.model')))
+            tr = ctranslate2.Translator(os.path.join(base, 'model'), device='cpu')
+            _TR_STATE['v'] = (bpe, tr)
+            log(f'terjemahan EN->ID siap (model {base})')
+    except Exception as e:
+        log(f'terjemahan EN->ID tidak tersedia: {type(e).__name__}: {str(e)[:120]}')
+    return _TR_STATE['v'] or None
+
+def translate_vtt_en_to_id(en_text):
+    lt = _load_tr()
+    if not lt: return None
+    bpe, tr = lt
+    blocks = en_text.replace('\r\n', '\n').split('\n\n')
+    parsed, texts = [], []
+    for b in blocks:
+        lines = b.split('\n')
+        ti = next((i for i, l in enumerate(lines) if '-->' in l), None)
+        if ti is None:
+            parsed.append((b, None)); continue
+        joined = ' '.join(l.strip() for l in lines[ti + 1:] if l.strip())
+        parsed.append(('\n'.join(lines[:ti + 1]), joined))
+        if joined: texts.append(joined)
+    if not texts: return None
+    uniq = list(dict.fromkeys(texts))
+    seg = [bpe.process_line(t).split() for t in uniq]
+    try:
+        results = tr.translate_batch(seg, beam_size=4)
+    except Exception:
+        return None
+    def dectok(toks):
+        return ''.join(t[:-2] if t.endswith('@@') else t + ' ' for t in toks).strip()
+    tmap = {t: dectok(r.hypotheses[0]) for t, r in zip(uniq, results)}
+    out = []
+    for head, joined in parsed:
+        if joined is None: out.append(head)
+        elif joined: out.append(head + '\n' + tmap.get(joined, joined))
+        else: out.append(head)
+    res = '\n\n'.join(out)
+    return res if res.lstrip().startswith('WEBVTT') else None
 
 def scrub(s):
     return (s or '').replace(TOKEN, '***')
@@ -319,6 +388,11 @@ def download_episode(slug_id, num, outdir, start_skip=0):
             vtt = fetch_subtitle_vtt(suris[lang], sref)
             if vtt: subs[lang] = vtt
         if len(subs) >= 2: break
+    if 'en' in subs and 'id' not in subs:
+        idt = translate_vtt_en_to_id(subs['en'])
+        if idt:
+            subs['id'] = idt
+            log(f'  ep{num}: sub ID dibuat dari EN (terjemahan Argos)')
     if subs:
         dur = sum(chunk_durs)
         for lang, vtt in subs.items():
